@@ -9,9 +9,8 @@ import os
 def make_move(game_id, board, client):
     """Asks the neural network engine for the best move and sends it to Lichess."""
     print("Bot is thinking...")
-    # You can increase the depth here if you want it to calculate further, 
-    # but depth=2 or 3 is a good start for testing!
-    best_move = engine.get_best_move(board, depth=2) 
+    # Iterative deepening with move-time budget keeps response reliable online.
+    best_move = engine.get_best_move(board, depth=5, time_limit=1.5)
     
     if best_move:
         print(f"Playing move: {best_move.uci()}")

@@ -1,0 +1,4 @@
+tensorflow==2.20.0
+numpy<2
+python-chess==1.999
+berserk==0.14.0

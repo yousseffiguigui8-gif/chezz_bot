@@ -9,3 +9,4 @@ lichessapi.txt
 best_chess_model.keras
 logs/
 training_data/
+book.bin
