@@ -2,10 +2,9 @@ import berserk
 import chess
 import engine
 import threading
+import os
 
-# --- CONFIGURATION ---
-# IMPORTANT: Put your brand new token here. Do NOT upload this file to GitHub!
-LICHESS_TOKEN = "PASTE_YOUR_NEW_TOKEN_HERE"
+
 
 def make_move(game_id, board, client):
     """Asks the neural network engine for the best move and sends it to Lichess."""
@@ -77,7 +76,11 @@ def play_game(game_id, client):
             pass
 
 def main():
-    session = berserk.TokenSession(LICHESS_TOKEN)
+    lichess_token = os.getenv("LICHESS_TOKEN")
+    if not lichess_token:
+        raise RuntimeError("Set the LICHESS_TOKEN environment variable before starting the bot.")
+
+    session = berserk.TokenSession(lichess_token)
     client = berserk.Client(session)
 
     try:

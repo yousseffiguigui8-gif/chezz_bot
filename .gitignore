@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+lichessapi.txt
+
+# Generated artifacts
+best_chess_model.keras
+logs/
+training_data/
