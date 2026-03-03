@@ -6,12 +6,53 @@ import os
 import time
 
 
+def phase_depth(board):
+    piece_count = len(board.piece_map())
+    if piece_count <= 12:
+        return 6
+    if piece_count <= 20:
+        return 5
+    return 4
 
-def make_move(game_id, board, client):
+
+def compute_time_limit(state, my_color, board):
+    if not state or my_color is None:
+        return 1.5
+
+    if my_color == chess.WHITE:
+        remaining_ms = state.get("wtime", 60000)
+        increment_ms = state.get("winc", 0)
+    else:
+        remaining_ms = state.get("btime", 60000)
+        increment_ms = state.get("binc", 0)
+
+    remaining = max(0.0, remaining_ms / 1000.0)
+    increment = max(0.0, increment_ms / 1000.0)
+    pieces = len(board.piece_map())
+
+    if remaining < 10:
+        return min(0.25, max(0.08, increment * 0.3 + 0.05))
+    if remaining < 30:
+        return min(0.8, max(0.2, increment * 0.5 + 0.2))
+
+    if pieces > 24:
+        divisor = 36
+    elif pieces > 14:
+        divisor = 28
+    else:
+        divisor = 22
+
+    allocation = (remaining / divisor) + (increment * 0.7)
+    return min(5.0, max(0.2, allocation))
+
+
+
+def make_move(game_id, board, client, state=None, my_color=None):
     """Asks the neural network engine for the best move and sends it to Lichess."""
     print("Bot is thinking...")
-    # Iterative deepening with move-time budget keeps response reliable online.
-    best_move = engine.get_best_move(board, depth=5, time_limit=1.5)
+    depth = phase_depth(board)
+    time_limit = compute_time_limit(state, my_color, board)
+    best_move = engine.get_best_move(board, depth=depth, time_limit=time_limit)
     
     if best_move:
         print(f"Playing move: {best_move.uci()}")
@@ -54,9 +95,10 @@ def play_game(game_id, client):
                     board.push_uci(m)
 
                 if board.turn == my_color and not board.is_game_over():
-                    make_move(game_id, board, client)
+                    make_move(game_id, board, client, state=state, my_color=my_color)
 
             elif event['type'] == 'gameState':
+                state = event
                 moves = event['moves'].split() if event['moves'] else []
                 board.clear_board()
                 board.set_fen(chess.STARTING_FEN)
@@ -64,7 +106,7 @@ def play_game(game_id, client):
                     board.push_uci(m)
 
                 if board.turn == my_color and not board.is_game_over():
-                    make_move(game_id, board, client)
+                    make_move(game_id, board, client, state=state, my_color=my_color)
     except Exception as e:
         print(f"Game stream error for {game_id}: {e}")
 

@@ -14,6 +14,7 @@ def parse_args():
     parser.add_argument("--depth", type=int, default=3, help="Search depth")
     parser.add_argument("--time-limit", type=float, default=1.0, help="Seconds per move")
     parser.add_argument("--disable-book", action="store_true", help="Disable opening book usage during evaluation")
+    parser.add_argument("--swap-colors", action="store_true", help="Play half games with swapped white/black models")
     parser.add_argument("--output-pgn", default="evaluation_games.pgn", help="Where to save played games")
     return parser.parse_args()
 
@@ -63,27 +64,71 @@ def play_game(model_white, model_black, depth, time_limit, disable_book):
     return board.result(claim_draw=True), game
 
 
+def evaluate_match(model_a, model_b, games, depth, time_limit, disable_book=False, swap_colors=False):
+    results = {"1-0": 0, "0-1": 0, "1/2-1/2": 0}
+    games_pgn = []
+
+    for game_index in range(1, games + 1):
+        if swap_colors and (game_index % 2 == 0):
+            white_model = model_b
+            black_model = model_a
+            swap = True
+        else:
+            white_model = model_a
+            black_model = model_b
+            swap = False
+
+        print(f"Playing game {game_index}/{games}...")
+        result, game = play_game(white_model, black_model, depth, time_limit, disable_book)
+        results[result] = results.get(result, 0) + 1
+
+        if swap:
+            if result == "1-0":
+                score_for_a = 0.0
+            elif result == "0-1":
+                score_for_a = 1.0
+            else:
+                score_for_a = 0.5
+            game.headers["White"] = "ModelB"
+            game.headers["Black"] = "ModelA"
+        else:
+            if result == "1-0":
+                score_for_a = 1.0
+            elif result == "0-1":
+                score_for_a = 0.0
+            else:
+                score_for_a = 0.5
+            game.headers["White"] = "ModelA"
+            game.headers["Black"] = "ModelB"
+
+        game.headers["ScoreForA"] = str(score_for_a)
+        games_pgn.append(game)
+
+    score_for_a = sum(float(g.headers.get("ScoreForA", "0.5")) for g in games_pgn)
+    return score_for_a, results, games_pgn
+
+
 def main():
     args = parse_args()
 
     model_white = load_model(args.model_white)
     model_black = load_model(args.model_black)
 
-    results = {"1-0": 0, "0-1": 0, "1/2-1/2": 0}
-    games = []
-
-    for game_index in range(1, args.games + 1):
-        print(f"Playing game {game_index}/{args.games}...")
-        result, game = play_game(model_white, model_black, args.depth, args.time_limit, args.disable_book)
-        results[result] = results.get(result, 0) + 1
-        games.append(game)
+    score_white, results, games = evaluate_match(
+        model_white,
+        model_black,
+        args.games,
+        args.depth,
+        args.time_limit,
+        disable_book=args.disable_book,
+        swap_colors=args.swap_colors,
+    )
 
     with open(args.output_pgn, "w", encoding="utf-8") as pgn_file:
         for game in games:
             print(game, file=pgn_file, end="\n\n")
 
     total = max(1, args.games)
-    score_white = results["1-0"] + 0.5 * results["1/2-1/2"]
     win_rate_white = score_white / total
 
     print("\n=== Evaluation Summary ===")

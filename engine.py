@@ -1,10 +1,12 @@
 import chess
 import chess.polyglot
+import chess.syzygy
 import numpy as np
 import tensorflow as tf
 from board_utils import board_to_tensor
 import random
 import time
+import os
 
 PIECE_VALUES = {
     chess.PAWN: 100,
@@ -18,8 +20,29 @@ PIECE_VALUES = {
 TT_EXACT = "exact"
 TT_LOWER = "lower"
 TT_UPPER = "upper"
-BOOK_PATH = "book.bin"
-BOOK_MAX_PLY = 24
+
+
+def _env_flag(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+BOOK_PATH = os.getenv("CHESS_BOOK_PATH", "book.bin")
+BOOK_MAX_PLY = int(os.getenv("CHESS_BOOK_MAX_PLY", "24"))
+BOOK_WEIGHTED = _env_flag("CHESS_BOOK_WEIGHTED", default=True)
+TABLEBASE_PATH = os.getenv("CHESS_TABLEBASE_PATH", "tablebases")
+USE_TABLEBASE = _env_flag("CHESS_USE_TABLEBASE", default=True)
+ASPIRATION_WINDOW = float(os.getenv("CHESS_ASPIRATION_WINDOW", "0.20"))
+
+TABLEBASE = None
+if USE_TABLEBASE and os.path.isdir(TABLEBASE_PATH):
+    try:
+        TABLEBASE = chess.syzygy.open_tablebase(TABLEBASE_PATH)
+        print(f"Syzygy tablebase enabled: {TABLEBASE_PATH}")
+    except Exception as tablebase_error:
+        print(f"Warning: Could not open tablebases at {TABLEBASE_PATH}. Error: {tablebase_error}")
 
 
 class SearchTimeout(Exception):
@@ -110,10 +133,33 @@ def get_book_move(board):
 
     try:
         with chess.polyglot.open_reader(BOOK_PATH) as reader:
-            entry = reader.weighted_choice(board)
+            if BOOK_WEIGHTED:
+                entry = reader.weighted_choice(board)
+            else:
+                entry = reader.find(board)
             return entry.move
     except Exception:
         return None
+
+
+def probe_tablebase_value(board):
+    """Returns a perfect endgame value from Syzygy if available."""
+    if TABLEBASE is None:
+        return None
+
+    if len(board.piece_map()) > 7:
+        return None
+
+    try:
+        wdl = TABLEBASE.probe_wdl(board)
+    except Exception:
+        return None
+
+    if wdl > 0:
+        return 1.0
+    if wdl < 0:
+        return -1.0
+    return 0.0
 
 def quiescence_search(board, alpha, beta, deadline=None):
     """Continues searching until all captures are resolved (No Horizon Effect)."""
@@ -144,6 +190,10 @@ def minimax(board, depth, alpha, beta, maximizing_player, transposition_table, k
     if deadline is not None and time.perf_counter() >= deadline:
         raise SearchTimeout()
 
+    tablebase_value = probe_tablebase_value(board)
+    if tablebase_value is not None:
+        return tablebase_value
+
     if depth == 0 or board.is_game_over():
         # Drop into quiescence search instead of stopping blindly
         return quiescence_search(board, alpha, beta, deadline)
@@ -172,9 +222,17 @@ def minimax(board, depth, alpha, beta, maximizing_player, transposition_table, k
     if maximizing_player:
         max_eval = -float('inf')
         best_move_node = None
-        for move in ordered_moves(board, killer_moves, history_table, ply=ply, pv_move=pv_move):
+        ordered = ordered_moves(board, killer_moves, history_table, ply=ply, pv_move=pv_move)
+        for index, move in enumerate(ordered):
             board.push(move)
-            eval = minimax(board, depth - 1, alpha, beta, False, transposition_table, killer_moves, history_table, ply + 1, deadline)
+
+            if index == 0:
+                eval = minimax(board, depth - 1, alpha, beta, False, transposition_table, killer_moves, history_table, ply + 1, deadline)
+            else:
+                eval = minimax(board, depth - 1, alpha, alpha + 1e-6, False, transposition_table, killer_moves, history_table, ply + 1, deadline)
+                if alpha < eval < beta:
+                    eval = minimax(board, depth - 1, alpha, beta, False, transposition_table, killer_moves, history_table, ply + 1, deadline)
+
             board.pop()
 
             if eval > max_eval:
@@ -194,9 +252,17 @@ def minimax(board, depth, alpha, beta, maximizing_player, transposition_table, k
     else:
         min_eval = float('inf')
         best_move_node = None
-        for move in ordered_moves(board, killer_moves, history_table, ply=ply, pv_move=pv_move):
+        ordered = ordered_moves(board, killer_moves, history_table, ply=ply, pv_move=pv_move)
+        for index, move in enumerate(ordered):
             board.push(move)
-            eval = minimax(board, depth - 1, alpha, beta, True, transposition_table, killer_moves, history_table, ply + 1, deadline)
+
+            if index == 0:
+                eval = minimax(board, depth - 1, alpha, beta, True, transposition_table, killer_moves, history_table, ply + 1, deadline)
+            else:
+                eval = minimax(board, depth - 1, beta - 1e-6, beta, True, transposition_table, killer_moves, history_table, ply + 1, deadline)
+                if alpha < eval < beta:
+                    eval = minimax(board, depth - 1, alpha, beta, True, transposition_table, killer_moves, history_table, ply + 1, deadline)
+
             board.pop()
 
             if eval < min_eval:
@@ -259,35 +325,58 @@ def get_best_move(board, depth=2, time_limit=None):
     for current_depth in range(1, max_depth + 1):
         current_best_move = None
         current_best_value = -float('inf') if board.turn == chess.WHITE else float('inf')
+        last_best_value = current_best_value
 
         try:
-            for move in ordered_legal_moves:
-                board.push(move)
-                board_value = minimax(
-                    board,
-                    current_depth - 1,
-                    -float('inf'),
-                    float('inf'),
-                    not board.turn,
-                    transposition_table,
-                    killer_moves,
-                    history_table,
-                    1,
-                    deadline,
-                )
-                board.pop()
+            alpha = -float('inf')
+            beta = float('inf')
+            if current_depth > 1 and np.isfinite(last_best_value):
+                alpha = last_best_value - ASPIRATION_WINDOW
+                beta = last_best_value + ASPIRATION_WINDOW
 
-                if board.turn == chess.WHITE:
-                    if board_value > current_best_value:
-                        current_best_value = board_value
-                        current_best_move = move
-                else:
-                    if board_value < current_best_value:
-                        current_best_value = board_value
-                        current_best_move = move
+            def evaluate_root(search_alpha, search_beta):
+                nonlocal current_best_move, current_best_value
+                current_best_move = None
+                current_best_value = -float('inf') if board.turn == chess.WHITE else float('inf')
+
+                local_alpha = search_alpha
+                local_beta = search_beta
+
+                for move in ordered_legal_moves:
+                    board.push(move)
+                    board_value = minimax(
+                        board,
+                        current_depth - 1,
+                        local_alpha,
+                        local_beta,
+                        not board.turn,
+                        transposition_table,
+                        killer_moves,
+                        history_table,
+                        1,
+                        deadline,
+                    )
+                    board.pop()
+
+                    if board.turn == chess.WHITE:
+                        if board_value > current_best_value:
+                            current_best_value = board_value
+                            current_best_move = move
+                        local_alpha = max(local_alpha, board_value)
+                    else:
+                        if board_value < current_best_value:
+                            current_best_value = board_value
+                            current_best_move = move
+                        local_beta = min(local_beta, board_value)
+
+            evaluate_root(alpha, beta)
+
+            if (current_best_value <= alpha) or (current_best_value >= beta):
+                evaluate_root(-float('inf'), float('inf'))
 
             if current_best_move is not None:
                 best_move = current_best_move
+                last_best_value = current_best_value
 
             if deadline is not None and time.perf_counter() >= deadline:
                 break

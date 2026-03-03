@@ -2,6 +2,7 @@ import tensorflow as tf
 import numpy as np
 import chess
 import chess.pgn
+import chess.engine
 import os
 import json
 from datetime import datetime
@@ -14,6 +15,10 @@ CACHE_DIR = "dataset_cache"
 CACHE_X_FILE = os.path.join(CACHE_DIR, "X_data.npy")
 CACHE_Y_FILE = os.path.join(CACHE_DIR, "y_data.npy")
 CACHE_META_FILE = os.path.join(CACHE_DIR, "metadata.json")
+MODEL_OUTPUT_PATH = os.getenv("MODEL_OUTPUT_PATH", "best_chess_model.keras")
+STOCKFISH_PATH = os.getenv("STOCKFISH_PATH")
+STOCKFISH_DEPTH = int(os.getenv("STOCKFISH_DEPTH", "10"))
+STOCKFISH_LABEL_FRACTION = float(os.getenv("STOCKFISH_LABEL_FRACTION", "0.25"))
 
 
 def configure_training_device():
@@ -61,6 +66,37 @@ def blended_target(board, game_result_value):
     return (0.8 * result_term) + (0.2 * material_term)
 
 
+def cp_to_value(cp_score):
+    return float(np.tanh(cp_score / 400.0))
+
+
+def stockfish_target(board, sf_engine, depth):
+    if sf_engine is None:
+        return None
+
+    try:
+        info = sf_engine.analyse(board, chess.engine.Limit(depth=depth))
+        score = info.get("score")
+        if score is None:
+            return None
+
+        pov = score.pov(chess.WHITE)
+        if pov.is_mate():
+            mate_score = pov.mate()
+            if mate_score is None:
+                return None
+            return 1.0 if mate_score > 0 else -1.0
+
+        cp = pov.score(mate_score=10000)
+        if cp is None:
+            return None
+
+        white_value = cp_to_value(cp)
+        return white_value if board.turn == chess.WHITE else -white_value
+    except Exception:
+        return None
+
+
 def warmup_cosine_schedule(total_steps, warmup_steps, base_lr=1e-3, min_lr=1e-5):
     def scheduler(step):
         if step < warmup_steps:
@@ -82,31 +118,50 @@ def load_training_data_from_pgn(pgn_path, max_positions=120000, min_ply=8, sampl
     features = []
     labels = []
     game_count = 0
+    sf_engine = None
 
-    with open(pgn_path, "r", encoding="utf-8", errors="ignore") as pgn_file:
-        while len(features) < max_positions:
-            game = chess.pgn.read_game(pgn_file)
-            if game is None:
-                break
+    if STOCKFISH_PATH and os.path.exists(STOCKFISH_PATH):
+        try:
+            sf_engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+            print(f"Stockfish labeling enabled: {STOCKFISH_PATH} (depth={STOCKFISH_DEPTH})")
+        except Exception as sf_error:
+            print(f"Warning: could not start Stockfish ({sf_error}); falling back to blended labels.")
+            sf_engine = None
 
-            result_value = game_result_to_value(game.headers.get("Result", "*"))
-            if result_value == 0.0 and game.headers.get("Result", "*") not in ("1/2-1/2",):
-                continue
-
-            board = game.board()
-            ply = 0
-            for move in game.mainline_moves():
-                if ply >= min_ply and (ply % sample_stride == 0):
-                    features.append(board_to_tensor(board))
-                    labels.append(blended_target(board, result_value))
-
-                board.push(move)
-                ply += 1
-
-                if len(features) >= max_positions:
+    try:
+        with open(pgn_path, "r", encoding="utf-8", errors="ignore") as pgn_file:
+            while len(features) < max_positions:
+                game = chess.pgn.read_game(pgn_file)
+                if game is None:
                     break
 
-            game_count += 1
+                result_value = game_result_to_value(game.headers.get("Result", "*"))
+                if result_value == 0.0 and game.headers.get("Result", "*") not in ("1/2-1/2",):
+                    continue
+
+                board = game.board()
+                ply = 0
+                for move in game.mainline_moves():
+                    if ply >= min_ply and (ply % sample_stride == 0):
+                        fallback_value = blended_target(board, result_value)
+                        sf_value = None
+                        if sf_engine is not None and np.random.random() < STOCKFISH_LABEL_FRACTION:
+                            sf_value = stockfish_target(board, sf_engine, STOCKFISH_DEPTH)
+
+                        label_value = (0.7 * sf_value + 0.3 * fallback_value) if sf_value is not None else fallback_value
+                        features.append(board_to_tensor(board))
+                        labels.append(label_value)
+
+                    board.push(move)
+                    ply += 1
+
+                    if len(features) >= max_positions:
+                        break
+
+                game_count += 1
+    finally:
+        if sf_engine is not None:
+            sf_engine.quit()
 
     if not features:
         raise ValueError("No valid positions were loaded from the PGN file.")
@@ -122,6 +177,9 @@ def load_or_build_dataset(pgn_path, max_positions):
         "pgn_size": os.path.getsize(pgn_path) if os.path.exists(pgn_path) else None,
         "pgn_mtime": os.path.getmtime(pgn_path) if os.path.exists(pgn_path) else None,
         "max_positions": max_positions,
+        "stockfish_path": STOCKFISH_PATH,
+        "stockfish_depth": STOCKFISH_DEPTH,
+        "stockfish_fraction": STOCKFISH_LABEL_FRACTION,
     }
 
     if os.path.exists(CACHE_X_FILE) and os.path.exists(CACHE_Y_FILE) and os.path.exists(CACHE_META_FILE):
@@ -177,7 +235,7 @@ def train_pipeline():
     # Smart callbacks for better training
     callbacks = [
         tf.keras.callbacks.LearningRateScheduler(warmup_cosine_schedule(total_steps, warmup_steps), verbose=0),
-        tf.keras.callbacks.ModelCheckpoint("best_chess_model.keras", monitor='val_loss', mode='min', save_best_only=True),
+        tf.keras.callbacks.ModelCheckpoint(MODEL_OUTPUT_PATH, monitor='val_loss', mode='min', save_best_only=True),
         tf.keras.callbacks.EarlyStopping(monitor='val_loss', mode='min', patience=6, restore_best_weights=True),
         tf.keras.callbacks.TensorBoard(log_dir="./logs"),
         tf.keras.callbacks.CSVLogger("training_log.csv", append=True),
@@ -198,6 +256,10 @@ def train_pipeline():
         "val_size": int(len(val_idx)),
         "batch_size": int(batch_size),
         "pgn_path": pgn_path,
+        "model_output_path": MODEL_OUTPUT_PATH,
+        "stockfish_path": STOCKFISH_PATH,
+        "stockfish_depth": STOCKFISH_DEPTH,
+        "stockfish_label_fraction": STOCKFISH_LABEL_FRACTION,
         "best_val_loss": float(min(history.history.get("val_loss", [float("inf")]))),
     }
     with open("training_run_metadata.json", "w", encoding="utf-8") as metadata_file:
