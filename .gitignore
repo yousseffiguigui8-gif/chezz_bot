@@ -17,3 +17,4 @@ baseline_model.keras
 candidate_model.keras
 promotion_match.pgn
 evaluation_games.pgn
+*.pgn

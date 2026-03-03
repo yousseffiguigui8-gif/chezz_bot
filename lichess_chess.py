@@ -4,6 +4,7 @@ import engine
 import threading
 import os
 import time
+from datetime import timedelta
 
 
 def phase_depth(board):
@@ -13,6 +14,18 @@ def phase_depth(board):
     if piece_count <= 20:
         return 5
     return 4
+
+
+def to_seconds(value, default_seconds):
+    if value is None:
+        return default_seconds
+    if isinstance(value, timedelta):
+        return max(0.0, value.total_seconds())
+    if isinstance(value, (int, float)):
+        if value > 1000:
+            return max(0.0, float(value) / 1000.0)
+        return max(0.0, float(value))
+    return default_seconds
 
 
 def compute_time_limit(state, my_color, board):
@@ -26,8 +39,8 @@ def compute_time_limit(state, my_color, board):
         remaining_ms = state.get("btime", 60000)
         increment_ms = state.get("binc", 0)
 
-    remaining = max(0.0, remaining_ms / 1000.0)
-    increment = max(0.0, increment_ms / 1000.0)
+    remaining = to_seconds(remaining_ms, 60.0)
+    increment = to_seconds(increment_ms, 0.0)
     pieces = len(board.piece_map())
 
     if remaining < 10:
