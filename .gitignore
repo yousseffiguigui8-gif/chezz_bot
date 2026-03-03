@@ -10,3 +10,5 @@ best_chess_model.keras
 logs/
 training_data/
 book.bin
+dataset_cache/
+training_run_metadata.json

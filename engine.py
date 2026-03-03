@@ -18,6 +18,8 @@ PIECE_VALUES = {
 TT_EXACT = "exact"
 TT_LOWER = "lower"
 TT_UPPER = "upper"
+BOOK_PATH = "book.bin"
+BOOK_MAX_PLY = 24
 
 
 class SearchTimeout(Exception):
@@ -68,10 +70,25 @@ def score_move(board, move):
     return score
 
 
-def ordered_moves(board):
+def ordered_moves(board, killer_moves=None, history_table=None, ply=0, pv_move=None):
     """Returns legal moves sorted by tactical priority."""
     moves = list(board.legal_moves)
-    moves.sort(key=lambda move: score_move(board, move), reverse=True)
+
+    killers = killer_moves.get(ply, []) if killer_moves else []
+
+    def move_priority(move):
+        priority = score_move(board, move)
+
+        if pv_move is not None and move == pv_move:
+            priority += 200000
+        if move in killers:
+            priority += 15000
+        if history_table:
+            priority += history_table.get((move.from_square, move.to_square), 0)
+
+        return priority
+
+    moves.sort(key=move_priority, reverse=True)
     return moves
 
 
@@ -88,8 +105,11 @@ def transposition_key(board, maximizing_player):
 
 def get_book_move(board):
     """Returns a Polyglot opening move when available."""
+    if board.ply() > BOOK_MAX_PLY:
+        return None
+
     try:
-        with chess.polyglot.open_reader("book.bin") as reader:
+        with chess.polyglot.open_reader(BOOK_PATH) as reader:
             entry = reader.weighted_choice(board)
             return entry.move
     except Exception:
@@ -119,7 +139,7 @@ def quiescence_search(board, alpha, beta, deadline=None):
             alpha = score
     return alpha
 
-def minimax(board, depth, alpha, beta, maximizing_player, transposition_table, deadline=None):
+def minimax(board, depth, alpha, beta, maximizing_player, transposition_table, killer_moves, history_table, ply=0, deadline=None):
     """The core alpha-beta pruning search tree."""
     if deadline is not None and time.perf_counter() >= deadline:
         raise SearchTimeout()
@@ -133,9 +153,11 @@ def minimax(board, depth, alpha, beta, maximizing_player, transposition_table, d
     alpha_original = alpha
     beta_original = beta
 
+    pv_move = None
     if cached and cached["depth"] >= depth:
         cached_value = cached["value"]
         cached_flag = cached["flag"]
+        pv_move = cached.get("best_move")
 
         if cached_flag == TT_EXACT:
             return cached_value
@@ -149,24 +171,46 @@ def minimax(board, depth, alpha, beta, maximizing_player, transposition_table, d
 
     if maximizing_player:
         max_eval = -float('inf')
-        for move in ordered_moves(board):
+        best_move_node = None
+        for move in ordered_moves(board, killer_moves, history_table, ply=ply, pv_move=pv_move):
             board.push(move)
-            eval = minimax(board, depth - 1, alpha, beta, False, transposition_table, deadline)
+            eval = minimax(board, depth - 1, alpha, beta, False, transposition_table, killer_moves, history_table, ply + 1, deadline)
             board.pop()
-            max_eval = max(max_eval, eval)
+
+            if eval > max_eval:
+                max_eval = eval
+                best_move_node = move
+
             alpha = max(alpha, eval)
             if beta <= alpha:
+                if not board.is_capture(move):
+                    killer_moves.setdefault(ply, [])
+                    if move not in killer_moves[ply]:
+                        killer_moves[ply] = (killer_moves[ply] + [move])[-2:]
+                    key = (move.from_square, move.to_square)
+                    history_table[key] = history_table.get(key, 0) + depth * depth
                 break
         value = max_eval
     else:
         min_eval = float('inf')
-        for move in ordered_moves(board):
+        best_move_node = None
+        for move in ordered_moves(board, killer_moves, history_table, ply=ply, pv_move=pv_move):
             board.push(move)
-            eval = minimax(board, depth - 1, alpha, beta, True, transposition_table, deadline)
+            eval = minimax(board, depth - 1, alpha, beta, True, transposition_table, killer_moves, history_table, ply + 1, deadline)
             board.pop()
-            min_eval = min(min_eval, eval)
+
+            if eval < min_eval:
+                min_eval = eval
+                best_move_node = move
+
             beta = min(beta, eval)
             if beta <= alpha:
+                if not board.is_capture(move):
+                    killer_moves.setdefault(ply, [])
+                    if move not in killer_moves[ply]:
+                        killer_moves[ply] = (killer_moves[ply] + [move])[-2:]
+                    key = (move.from_square, move.to_square)
+                    history_table[key] = history_table.get(key, 0) + depth * depth
                 break
         value = min_eval
 
@@ -181,6 +225,7 @@ def minimax(board, depth, alpha, beta, maximizing_player, transposition_table, d
         "depth": depth,
         "value": value,
         "flag": flag,
+        "best_move": best_move_node,
     }
 
     return value
@@ -194,13 +239,10 @@ def get_best_move(board, depth=2, time_limit=None):
     if not legal_moves:
         return None
 
-    try:
-        with chess.polyglot.open_reader("book.bin") as reader:
-            move = reader.weighted_choice(board).move
-            print("--- Book move played ---")
-            return move
-    except Exception:
-        pass
+    book_move = get_book_move(board)
+    if book_move:
+        print("--- Book move played ---")
+        return book_move
 
     print("No book move. Thinking...")
 
@@ -208,6 +250,8 @@ def get_best_move(board, depth=2, time_limit=None):
     fallback_move = ordered_legal_moves[0] if ordered_legal_moves else random.choice(legal_moves)
 
     transposition_table = {}
+    killer_moves = {}
+    history_table = {}
     best_move = fallback_move
     deadline = None if time_limit is None else time.perf_counter() + max(0.01, float(time_limit))
     max_depth = max(1, int(depth))
@@ -226,6 +270,9 @@ def get_best_move(board, depth=2, time_limit=None):
                     float('inf'),
                     not board.turn,
                     transposition_table,
+                    killer_moves,
+                    history_table,
+                    1,
                     deadline,
                 )
                 board.pop()

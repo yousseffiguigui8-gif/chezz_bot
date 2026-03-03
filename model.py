@@ -39,7 +39,7 @@ def create_chess_model():
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
     
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), 
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0), 
         loss="mse", 
         metrics=["mae"]
     )

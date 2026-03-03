@@ -3,6 +3,7 @@ import chess
 import engine
 import threading
 import os
+import time
 
 
 
@@ -36,43 +37,36 @@ def play_game(game_id, client):
         print(f"Could not fetch account info: {e}")
         return
 
-    # Listen to the live game stream
-    for event in client.bots.stream_game_state(game_id):
-        if event['type'] == 'gameFull':
-            # Identify our color when the game starts
-            white_player = event['white'].get('id', '')
-            if white_player == bot_username.lower():
-                my_color = chess.WHITE
-                print("Playing as WHITE")
-            else:
-                my_color = chess.BLACK
-                print("Playing as BLACK")
+    try:
+        for event in client.bots.stream_game_state(game_id):
+            if event['type'] == 'gameFull':
+                white_player = event['white'].get('id', '')
+                if white_player == bot_username.lower():
+                    my_color = chess.WHITE
+                    print("Playing as WHITE")
+                else:
+                    my_color = chess.BLACK
+                    print("Playing as BLACK")
 
-            # Apply any moves that have already been played
-            state = event['state']
-            moves = state['moves'].split() if state['moves'] else []
-            for m in moves:
-                board.push_uci(m)
-            
-            # If we are White, we need to make the first move immediately
-            if board.turn == my_color and not board.is_game_over():
-                make_move(game_id, board, client)
+                state = event['state']
+                moves = state['moves'].split() if state['moves'] else []
+                for m in moves:
+                    board.push_uci(m)
 
-        elif event['type'] == 'gameState':
-            # Update board with the latest moves from Lichess
-            moves = event['moves'].split() if event['moves'] else []
-            board.clear_board()
-            board.set_fen(chess.STARTING_FEN)
-            for m in moves:
-                board.push_uci(m)
-            
-            # If it's our turn, calculate and send the move
-            if board.turn == my_color and not board.is_game_over():
-                make_move(game_id, board, client)
-                
-        elif event['type'] == 'chatLine':
-            # Optional: You can make the bot reply to chat messages here!
-            pass
+                if board.turn == my_color and not board.is_game_over():
+                    make_move(game_id, board, client)
+
+            elif event['type'] == 'gameState':
+                moves = event['moves'].split() if event['moves'] else []
+                board.clear_board()
+                board.set_fen(chess.STARTING_FEN)
+                for m in moves:
+                    board.push_uci(m)
+
+                if board.turn == my_color and not board.is_game_over():
+                    make_move(game_id, board, client)
+    except Exception as e:
+        print(f"Game stream error for {game_id}: {e}")
 
 def main():
     lichess_token = os.getenv("LICHESS_TOKEN")
@@ -91,23 +85,27 @@ def main():
         pass
 
     print("Listening for Lichess challenges...")
-    
-    # Stream incoming events (invites, game starts, etc.)
-    try:
-        for event in client.bots.stream_incoming_events():
-            if event['type'] == 'challenge':
-                challenge_id = event['challenge']['id']
-                challenger = event['challenge']['challenger']['name']
-                print(f"Accepting challenge from {challenger} (ID: {challenge_id})...")
-                client.bots.accept_challenge(challenge_id)
-                
-            elif event['type'] == 'gameStart':
-                game_id = event['game']['id']
-                # Run the game in a new thread so the bot can accept multiple games at once!
-                threading.Thread(target=play_game, args=(game_id, client)).start()
-                
-    except Exception as e:
-         print(f"Connection error: {e}. Restarting script is recommended.")
+
+    retry_delay = 2
+    while True:
+        try:
+            for event in client.bots.stream_incoming_events():
+                if event['type'] == 'challenge':
+                    challenge_id = event['challenge']['id']
+                    challenger = event['challenge']['challenger']['name']
+                    print(f"Accepting challenge from {challenger} (ID: {challenge_id})...")
+                    client.bots.accept_challenge(challenge_id)
+
+                elif event['type'] == 'gameStart':
+                    game_id = event['game']['id']
+                    thread = threading.Thread(target=play_game, args=(game_id, client), daemon=True)
+                    thread.start()
+
+            retry_delay = 2
+        except Exception as e:
+            print(f"Connection error: {e}. Reconnecting in {retry_delay}s...")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
 
 if __name__ == "__main__":
     main()
