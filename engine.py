@@ -194,10 +194,13 @@ def get_best_move(board, depth=2, time_limit=None):
     if not legal_moves:
         return None
 
-    book_move = get_book_move(board)
-    if book_move:
-        print("Book move found!")
-        return book_move
+    try:
+        with chess.polyglot.open_reader("book.bin") as reader:
+            move = reader.weighted_choice(board).move
+            print("--- Book move played ---")
+            return move
+    except Exception:
+        pass
 
     print("No book move. Thinking...")
 
